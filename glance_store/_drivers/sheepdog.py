@@ -1,4 +1,5 @@
 # Copyright 2013 Taobao Inc.
+# Copyright (C) 2015 Nippon Telegraph and Telephone Corporation.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -25,15 +26,18 @@ from oslo_utils import units
 
 import glance_store
 from glance_store import capabilities
+from glance_store.common import utils
 import glance_store.driver
 from glance_store import exceptions
-from glance_store.i18n import _
+from glance_store.i18n import _, _LE
 import glance_store.location
 
+# Sheepdog VDI snapshot name for glance image
+GLANCE_SNAPNAME = 'glance-image'
 
 LOG = logging.getLogger(__name__)
 
-DEFAULT_ADDR = 'localhost'
+DEFAULT_ADDR = '127.0.0.1'
 DEFAULT_PORT = 7000
 DEFAULT_CHUNKSIZE = 64  # in MiB
 
@@ -59,7 +63,7 @@ class SheepdogImage(object):
         self.chunk_size = chunk_size
 
     def _run_command(self, command, data, *params):
-        cmd = ("collie vdi %(command)s -a %(addr)s -p %(port)d %(name)s "
+        cmd = ("dog vdi %(command)s -a %(addr)s -p %(port)d %(name)s "
                "%(params)s" %
                {"command": command,
                 "addr": self.addr,
@@ -78,26 +82,38 @@ class SheepdogImage(object):
         """
         Return the size of the this iamge
 
-        Sheepdog Usage: collie vdi list -r -a address -p port image
+        Sheepdog Usage: dog vdi list -r -a address -p port image
         """
         out = self._run_command("list -r", None)
         return long(out.split(' ')[3])
 
+    def resize(self, size):
+        """
+        Resize this image to new 'size' in the Sheepdog cluster.
+
+        Sheepdog Usage:
+                 dog vdi resize -a address -p port image size
+        """
+        self._run_command("resize", None, str(size))
+
+    # glance-image is stored in Sheepdog as snapshot, so read from snapshot.
     def read(self, offset, count):
         """
         Read up to 'count' bytes from this image starting at 'offset' and
         return the data.
 
-        Sheepdog Usage: collie vdi read -a address -p port image offset len
+        Sheepdog Usage:
+                 dog vdi read -s snap -a address -p port image offset len
         """
-        return self._run_command("read", None, str(offset), str(count))
+        return self._run_command("read -s %s" % GLANCE_SNAPNAME,
+                                 None, str(offset), str(count))
 
     def write(self, data, offset, count):
         """
         Write up to 'count' bytes from the data to this image starting at
         'offset'
 
-        Sheepdog Usage: collie vdi write -a address -p port image offset len
+        Sheepdog Usage: dog vdi write -a address -p port image offset len
         """
         self._run_command("write", data, str(offset), str(count))
 
@@ -105,7 +121,7 @@ class SheepdogImage(object):
         """
         Create this image in the Sheepdog cluster with size 'size'.
 
-        Sheepdog Usage: collie vdi create -a address -p port image size
+        Sheepdog Usage: dog vdi create -a address -p port image size
         """
         self._run_command("create", None, str(size))
 
@@ -113,15 +129,31 @@ class SheepdogImage(object):
         """
         Delete this image in the Sheepdog cluster
 
-        Sheepdog Usage: collie vdi delete -a address -p port image
+        Sheepdog Usage: dog vdi delete -a address -p port image
         """
         self._run_command("delete", None)
+
+    def create_snapshot(self):
+        """
+        Create this image in the Sheepdog cluster with size 'size'.
+
+        Sheepdog Usage: dog vdi create -s snap -a address -p port image size
+        """
+        self._run_command("snapshot -s %s" % GLANCE_SNAPNAME, None)
+
+    def delete_snapshot(self):
+        """
+        Delete this image from the Sheepdog cluster .
+
+        Sheepdog Usage: dog vdi delete -s snap -a address -p port
+        """
+        self._run_command("delete -s %s" % GLANCE_SNAPNAME, None)
 
     def exist(self):
         """
         Check if this image exists in the Sheepdog cluster via 'list' command
 
-        Sheepdog Usage: collie vdi list -r -a address -p port image
+        Sheepdog Usage: dog vdi list -r -a address -p port image
         """
         out = self._run_command("list -r", None)
         if not out:
@@ -205,7 +237,7 @@ class Store(glance_store.driver.Store):
                                                    reason=reason)
 
         try:
-            processutils.execute("collie", shell=True)
+            processutils.execute("dog", shell=True)
         except processutils.ProcessExecutionError as exc:
             reason = _("Error in store configuration: %s") % exc
             LOG.error(reason)
@@ -265,32 +297,79 @@ class Store(glance_store.driver.Store):
         :retval tuple of URL in backing store, bytes written, and checksum
         :raises `glance_store.exceptions.Duplicate` if the image already
                 existed
+        :raises `glance_store.exceptions.BackendException` if the image already
+                deleted
         """
 
         image = SheepdogImage(self.addr, self.port, image_id,
                               self.WRITE_CHUNKSIZE)
         if image.exist():
-            raise exceptions.Duplicate(_("Sheepdog image %s already exists")
-                                       % image_id)
+            raise exceptions.Duplicate(image=image_id)
 
         location = StoreLocation({'image': image_id}, self.conf)
         checksum = hashlib.md5()
 
-        image.create(image_size)
+        try:
+            image.create(image_size)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE('Fail to create glance-image as Sheepdog VDI. '
+                              'src image file: %(image)s, size: %(size)s.'),
+                          {'image': image_file, 'size': image_size})
+
+        if image_size == 0:
+            try:
+                chunks = utils.chunkreadable(image_file, self.WRITE_CHUNKSIZE)
+                offset = 0
+                for chunk in chunks:
+                    image_size += len(chunk)
+                    image.resize(image_size)
+                    image.write(chunk, offset, len(chunk))
+                    checksum.update(chunk)
+                    offset += len(chunk)
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to extend image file or '
+                                  'write data: %s.'), image_id)
+                    image.delete()
+        else:
+            try:
+                total = left = image_size
+                while left > 0:
+                    length = min(self.chunk_size, left)
+                    data = image_file.read(length)
+                    image.write(data, total - left, length)
+                    left -= length
+                    checksum.update(data)
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.error(_LE('Fail to read image file or write data '
+                                  'src image file: %(image)s, image size: '
+                                  '%(size)s Sheepdog VDI name: %(vdiname)s.'),
+                              {'image': image_file, 'size': image_size,
+                               'vdiname': image_id})
+                    image.delete()
 
         try:
-            total = left = image_size
-            while left > 0:
-                length = min(self.chunk_size, left)
-                data = image_file.read(length)
-                image.write(data, total - left, length)
-                left -= length
-                checksum.update(data)
+            # create snapshot because images stores snapshot
+            image.create_snapshot()
         except Exception:
             # Note(zhiyan): clean up already received data when
             # error occurs such as ImageSizeLimitExceeded exceptions.
             with excutils.save_and_reraise_exception():
+                LOG.error(_LE('Fail to create Sheepdog snapshot '
+                              'Sheepdog VDI name: %s.'), image_id)
                 image.delete()
+
+        try:
+            # delete current image, use snapshot at sheepdog
+            image.delete()
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE('Fail to delete temporary Sheepdog VDI '
+                              'Sheepdog VDI name: %(vdiname)s.'),
+                          {'vdiname': image_id})
+                image.delete_snapshot()
 
         return (location.get_uri(), image_size, checksum.hexdigest(), {})
 
@@ -310,6 +389,16 @@ class Store(glance_store.driver.Store):
         image = SheepdogImage(self.addr, self.port, loc.image,
                               self.WRITE_CHUNKSIZE)
         if not image.exist():
-            raise exceptions.NotFound(_("Sheepdog image %s does not exist") %
-                                      loc.image)
-        image.delete()
+            msg = _("Sheepdog image %s does not exist.") % loc.image
+            raise exceptions.NotFound(message=msg)
+
+        # delete the image that was stored as snapshot
+        try:
+            image.delete_snapshot()
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                # Reraise the original exception
+                LOG.error(_LE('Fail to delete a Sheepdog snapshot of '
+                              'glance-image. VDI name: %(vdiname)s, '
+                              'snapshot name: %(snap)s.'),
+                          {'vdiname': image.name, 'snap': GLANCE_SNAPNAME})
